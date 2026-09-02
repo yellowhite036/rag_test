@@ -11,13 +11,23 @@ import ollama
 # 事實查核用(選項 9 進階查核),非必要但強烈建議安裝:
 #   pip install transformers torch
 # 首次查核時會自動下載 NLI_MODEL 指定的模型(約數百 MB),請保持網路暢通。
-FOLDER = Path(".").resolve()
+
+# === 資料夾結構 ===
+# ./agent.py            <- 本程式
+# ./prompts/             <- prompt 範本檔(prompt_code.txt / prompt_data.txt)
+# ./files/                <- 要被索引 / 打包 / 修改的目標檔案(.py / .csv)
+FOLDER = Path(".").resolve()          # 主程式所在資料夾(輸出檔、索引檔、備份都放這裡)
+PROMPT_DIR = FOLDER / "prompts"       # prompt 範本資料夾
+FILES_DIR = FOLDER / "files"          # 目標檔案資料夾(程式碼 / 資料表格都放這裡)
+
 DEFAULT_EXT = [".py"]        # 程式碼索引專用副檔名
 DATA_EXT = [".csv"]          # 資料表格索引專用副檔名(跟程式碼分開,避免混在一起)
 LLM_MODEL = "qwen2.5:7b-instruct-q4_K_M"
 EMBED_MODEL = "nomic-embed-text"  # 需先用 `ollama pull nomic-embed-text` 下載
-RAG_INDEX_FILE = "rag_index.json"           # 程式碼索引檔
+RAG_INDEX_FILE = "rag_index.json"           # 程式碼索引檔(存在 FOLDER 底下)
 RAG_DATA_INDEX_FILE = "rag_data_index.json"  # 資料表格索引檔(獨立檔案,不會互相覆蓋)
+PROMPT_CODE_FILE = PROMPT_DIR / "prompt_code.txt"   # 程式碼問答模式的 prompt 範本
+PROMPT_DATA_FILE = PROMPT_DIR / "prompt_data.txt"   # 資料表格問答模式的 prompt 範本
 RAG_CHUNK_LINES = 60      # 每個索引片段的行數
 RAG_CHUNK_OVERLAP = 10    # 片段之間重疊的行數,避免切在函式中間找不到上下文
 RAG_TOP_K = 8             # 查詢時取最相關的幾個片段
@@ -40,23 +50,47 @@ NLI_MODEL = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
 NLI_ENTAIL_THRESHOLD = 0.5
 PATTERN = re.compile(r"##### FILE_START: (.+?) #####\n(.*?)\n##### FILE_END #####", re.DOTALL)
 SELF_FILE = Path(__file__).resolve().name
+
+
+def _ensure_dirs():
+    """啟動時確保 prompts/ 與 files/ 資料夾存在。"""
+    created = []
+    for d in (PROMPT_DIR, FILES_DIR):
+        if not d.exists():
+            d.mkdir(parents=True, exist_ok=True)
+            created.append(d)
+    if created:
+        print("已自動建立以下資料夾:")
+        for d in created:
+            print(f"  - {d}")
+        print("請把要索引/修改的 .py、.csv 檔放進 files/,")
+        print("把 prompt_code.txt、prompt_data.txt 放進 prompts/。\n")
+
+
 def _flush_stdin():
     try:
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
     except Exception:
         pass
+
+
 def _files(ext_list, folder=None):
-    folder = folder or FOLDER
+    """掃描目標檔案資料夾(預設 FILES_DIR)裡符合副檔名的檔案。"""
+    folder = folder or FILES_DIR
     files = []
     for ext in ext_list:
         files += sorted(folder.rglob(f"*{ext}"))
     return [f for f in files if ".backup" not in str(f) and "__pycache__" not in str(f) and f.name != SELF_FILE]
+
+
 def _copy_to_clipboard(text: str) -> bool:
     try:
         subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), check=True)
         return True
     except Exception:
         return False
+
+
 def _read_clipboard() -> str:
     try:
         result = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, text=True, check=True)
@@ -64,7 +98,11 @@ def _read_clipboard() -> str:
     except Exception as e:
         print(f"讀取剪貼簿失敗:{e}(請確認已安裝 xclip)")
         return ""
+
+
 _IGNORE_NAMES = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".idea", ".vscode"}
+
+
 def _is_ignored(p: Path) -> bool:
     if p.name in _IGNORE_NAMES:
         return True
@@ -73,6 +111,8 @@ def _is_ignored(p: Path) -> bool:
     if p.name == SELF_FILE:
         return True
     return False
+
+
 def _print_tree(folder: Path, prefix: str = ""):
     try:
         entries = sorted(
@@ -93,13 +133,15 @@ def _print_tree(folder: Path, prefix: str = ""):
         if entry.is_dir():
             extension = "    " if is_last else "│   "
             _print_tree(entry, prefix + extension)
+
+
 def show_structure():
     _flush_stdin()
-    path_input = input(f"請輸入要顯示的資料夾路徑(留空使用目前資料夾 {FOLDER}): ").strip()
+    path_input = input(f"請輸入要顯示的資料夾路徑(留空使用目標檔案資料夾 {FILES_DIR}): ").strip()
     if path_input:
         target_folder = Path(path_input).expanduser().resolve()
     else:
-        target_folder = FOLDER
+        target_folder = FILES_DIR
     if not target_folder.exists():
         print(f"路徑不存在:{target_folder}")
         return
@@ -110,10 +152,12 @@ def show_structure():
     print(f"{target_folder.name}/")
     _print_tree(target_folder)
     print()
+
+
 def collect_for_claude():
     blocks = []
     for f in _files(DEFAULT_EXT):
-        rel = f.relative_to(FOLDER)
+        rel = f.relative_to(FILES_DIR)
         content = f.read_text(encoding="utf-8", errors="replace")
         blocks.append(f"##### FILE_START: {rel} #####\n{content}\n##### FILE_END #####")
     text = "\n\n".join(blocks)
@@ -121,10 +165,12 @@ def collect_for_claude():
     ok = _copy_to_clipboard(text)
     print(f"\n已整理 {len(text)} 字元 → collected.txt")
     print("已複製到剪貼簿,可直接貼給 Claude" if ok else "請手動打開 collected.txt 複製")
+
+
 def summarize_with_local_model():
     blocks = []
     for f in _files(DEFAULT_EXT):
-        rel = f.relative_to(FOLDER)
+        rel = f.relative_to(FILES_DIR)
         content = f.read_text(encoding="utf-8", errors="replace")
         print(f"分析中:{rel} ...")
         prompt = f"""請用繁體中文簡短條列:1)整體用途 2)定義的函式與各自作用 3)明顯的TODO或寫死參數
@@ -138,6 +184,8 @@ def summarize_with_local_model():
     ok = _copy_to_clipboard(text)
     print(f"\n已存到 summary.txt")
     print("已複製到剪貼簿" if ok else "請手動打開 summary.txt 複製")
+
+
 def _apply_matches(matches):
     print(f"\n偵測到 {len(matches)} 個檔案異動:")
     for rel_path, _ in matches:
@@ -148,14 +196,14 @@ def _apply_matches(matches):
     if confirm.lower() != "y":
         print("已取消")
         return
-    backup_dir = FOLDER / f".backup_{datetime.now():%Y%m%d_%H%M%S}"
+    backup_dir = FILES_DIR / f".backup_{datetime.now():%Y%m%d_%H%M%S}"
     backup_dir.mkdir(exist_ok=True)
     for rel_path, content in matches:
         rel_path = rel_path.strip()
         if Path(rel_path).name == SELF_FILE:
             print(f"已跳過(保護工具自身):{rel_path}")
             continue
-        target = FOLDER / rel_path
+        target = FILES_DIR / rel_path
         if target.exists():
             bkp = backup_dir / rel_path
             bkp.parent.mkdir(parents=True, exist_ok=True)
@@ -164,6 +212,8 @@ def _apply_matches(matches):
         target.write_text(content, encoding="utf-8")
         print(f"已更新:{rel_path}")
     print(f"備份於:{backup_dir}")
+
+
 def apply_from_clipboard():
     text = _read_clipboard()
     matches = PATTERN.findall(text)
@@ -171,6 +221,8 @@ def apply_from_clipboard():
         print("剪貼簿內容沒有符合 FILE_START/FILE_END 格式,取消套用")
         return
     _apply_matches(matches)
+
+
 def auto_edit_with_local_model():
     print("請先把修改指令『複製』到剪貼簿(不要直接貼在這個終端機視窗裡),完成後回到這裡按一下 Enter 繼續...")
     input()
@@ -190,7 +242,7 @@ def auto_edit_with_local_model():
         return
     blocks = []
     for f in _files(DEFAULT_EXT):
-        rel = f.relative_to(FOLDER)
+        rel = f.relative_to(FILES_DIR)
         content = f.read_text(encoding="utf-8", errors="replace")
         blocks.append(f"##### FILE_START: {rel} #####\n{content}\n##### FILE_END #####")
     files_text = "\n\n".join(blocks)
@@ -215,6 +267,8 @@ def auto_edit_with_local_model():
         print(result[:500])
         return
     _apply_matches(matches)
+
+
 def extract_relevant_code_with_local_model():
     print("請先把 Claude 提出的『需要修改的部份』說明複製到剪貼簿(不要直接貼在這個終端機視窗裡),完成後回到這裡按一下 Enter 繼續...")
     input()
@@ -234,7 +288,7 @@ def extract_relevant_code_with_local_model():
         return
     blocks = []
     for f in _files(DEFAULT_EXT):
-        rel = f.relative_to(FOLDER)
+        rel = f.relative_to(FILES_DIR)
         content = f.read_text(encoding="utf-8", errors="replace")
         blocks.append(f"##### FILE_START: {rel} #####\n{content}\n##### FILE_END #####")
     files_text = "\n\n".join(blocks)
@@ -268,9 +322,13 @@ def extract_relevant_code_with_local_model():
     for rel_path, _ in matches:
         print(f"  - {rel_path.strip()}")
     print("已複製到剪貼簿,可貼給 Claude 取得詳細修改步驟" if ok else "請手動打開 relevant_files.txt 複製")
+
+
 def review_with_claude():
     print("正在打包目前(修改後)的完整程式碼,準備貼給 Claude 檢查...")
     collect_for_claude()
+
+
 def _chunk_text(text, chunk_lines=RAG_CHUNK_LINES, overlap_lines=RAG_CHUNK_OVERLAP):
     lines = text.splitlines()
     if not lines:
@@ -287,6 +345,8 @@ def _chunk_text(text, chunk_lines=RAG_CHUNK_LINES, overlap_lines=RAG_CHUNK_OVERL
             break
         i += step
     return chunks
+
+
 def _cosine_sim(a, b):
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
@@ -294,21 +354,23 @@ def _cosine_sim(a, b):
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
+
+
 def build_rag_index(ext_list, index_file, mode_label):
     """
     建立/更新 RAG 索引(泛用版,可用於程式碼或資料表格)。
-    把資料夾內符合 ext_list 副檔名的檔案切成片段,逐片段呼叫 Ollama 的
-    embedding 模型算出向量,存成 index_file,供查詢時使用。
+    把 files/ 資料夾內符合 ext_list 副檔名的檔案切成片段,逐片段呼叫 Ollama 的
+    embedding 模型算出向量,存成 index_file(放在主程式資料夾),供查詢時使用。
     """
     files = _files(ext_list)
     if not files:
-        print(f"找不到可索引的檔案(副檔名:{', '.join(ext_list)})")
+        print(f"在 {FILES_DIR} 裡找不到可索引的檔案(副檔名:{', '.join(ext_list)})")
         return
     print(f"開始建立【{mode_label}】RAG 索引,共 {len(files)} 個檔案,使用 embedding 模型:{EMBED_MODEL}")
     index = []
     fail_count = 0
     for f in files:
-        rel = str(f.relative_to(FOLDER))
+        rel = str(f.relative_to(FILES_DIR))
         content = f.read_text(encoding="utf-8", errors="replace")
         chunks = _chunk_text(content)
         print(f"  {rel}: {len(chunks)} 個片段")
@@ -337,12 +399,18 @@ def build_rag_index(ext_list, index_file, mode_label):
     index_path = FOLDER / index_file
     index_path.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
     print(f"\n已建立【{mode_label}】RAG 索引:{len(index)} 個片段(失敗 {fail_count} 個)→ {index_path}")
+
+
 def build_code_index():
-    """選項 8:建立/更新「程式碼」RAG 索引(只吃 .py)。"""
+    """選項 8:建立/更新「程式碼」RAG 索引(只吃 files/ 底下的 .py)。"""
     build_rag_index(DEFAULT_EXT, RAG_INDEX_FILE, "程式碼")
+
+
 def build_data_index():
-    """選項 9:建立/更新「資料表格」RAG 索引(只吃 .csv)。"""
+    """選項 9:建立/更新「資料表格」RAG 索引(只吃 files/ 底下的 .csv)。"""
     build_rag_index(DATA_EXT, RAG_DATA_INDEX_FILE, "資料表格")
+
+
 def _load_rag_index(index_file):
     index_path = FOLDER / index_file
     if not index_path.exists():
@@ -352,6 +420,21 @@ def _load_rag_index(index_file):
     except Exception as e:
         print(f"讀取索引失敗:{e}")
         return None
+
+
+def _load_prompt_template(path) -> str:
+    """
+    讀取 prompts/ 資料夾底下的 prompt 範本檔(prompt_code.txt / prompt_data.txt)。
+    範本內用 {question} 與 {context_text} 這兩個佔位字串,讀取後用
+    str.format() 代入實際內容。獨立成外部檔案的目的是讓 code/data
+    兩種模式各自的措辭可以直接編輯 txt 檔調整,不用改動程式本身。
+    """
+    template_path = Path(path)
+    if not template_path.exists():
+        raise FileNotFoundError(f"找不到 prompt 範本檔案:{template_path}")
+    return template_path.read_text(encoding="utf-8")
+
+
 def _check_coverage_hints(question: str, retrieved_files):
     warnings = []
     q_lower = question.lower()
@@ -367,6 +450,8 @@ def _check_coverage_hints(question: str, retrieved_files):
             if not any(expected in f for f in retrieved_lower):
                 warnings.append(f"問題疑似跟「{expected}」有關,但這次檢索到的片段裡沒有這個檔案")
     return warnings
+
+
 # === 規則式查核(不靠模型,只靠正則表達式) ===
 _NUM_RE = re.compile(r'-?\d+\.\d+|-?\d+')
 _DATE_RE = re.compile(r'\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{4}年\d{1,2}月(?:\d{1,2}日)?|\d{4}年')
@@ -374,12 +459,16 @@ _BACKTICK_RE = re.compile(r'`([^`\n]{1,60})`')
 _FUNC_CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]{1,40})\s*\(')
 _SNAKE_RE = re.compile(r'\b[a-zA-Z_][a-zA-Z0-9]*_[a-zA-Z0-9_]+\b')
 _PY_FILE_RE = re.compile(r'\b[\w./\\-]+\.py\b')
+
+
 def _extract_code_entities(text: str):
     ents = set()
     ents.update(m.strip() for m in _BACKTICK_RE.findall(text) if m.strip())
     ents.update(_FUNC_CALL_RE.findall(text))
     ents.update(_SNAKE_RE.findall(text))
     return ents
+
+
 def _rule_based_check(answer: str, context_text: str, retrieved_files, question: str = "", mode: str = "code"):
     """
     規則式查核。mode="code" 時比照原本邏輯(數字/日期/程式碼識別字/.py檔名 都查);
@@ -415,6 +504,8 @@ def _rule_based_check(answer: str, context_text: str, retrieved_files, question:
         if missing_files:
             issues.append(f"回答提到的檔案不在這次檢索到的片段來源中:{', '.join(missing_files)}")
     return issues
+
+
 def _sentence_missing_tokens(sentence: str, context_text: str, retrieved_files, mode: str = "code") -> list:
     missing = []
     missing += [n for n in set(_NUM_RE.findall(sentence)) if n not in context_text]
@@ -424,8 +515,12 @@ def _sentence_missing_tokens(sentence: str, context_text: str, retrieved_files, 
         missing += [f for f in set(_PY_FILE_RE.findall(sentence))
                     if not any(f in rf or rf in f for rf in retrieved_files)]
     return missing
+
+
 # === NLI 查核(獨立架構模型,不同於生成模型) ===
 _nli_pipeline = None
+
+
 def _get_nli_pipeline():
     global _nli_pipeline
     if _nli_pipeline is False:
@@ -446,6 +541,8 @@ def _get_nli_pipeline():
         _nli_pipeline = False
         return None
     return _nli_pipeline
+
+
 def _nli_check(sentences, context_items):
     nli = _get_nli_pipeline()
     if nli is None:
@@ -463,6 +560,8 @@ def _nli_check(sentences, context_items):
                 best_score, best_src = entail, f"{item['file']} 行{item['start_line']}-{item['end_line']}"
         results.append({"sentence": sent, "score": best_score, "source": best_src})
     return results
+
+
 def _run_fact_checks(context_items, context_text, retrieved_files, answer, question: str = "", mode: str = "code"):
     print("\n=== 規則式查核(數字 / 日期" + (" / 程式碼識別字 / 檔名" if mode == "code" else "") + ")===")
     rule_issues = _rule_based_check(answer, context_text, retrieved_files, question=question, mode=mode)
@@ -497,6 +596,8 @@ def _run_fact_checks(context_items, context_text, retrieved_files, answer, quest
             print(f"\n  🚨 共 {conflict_count} 句查核結果衝突,建議優先人工確認這幾句。")
     print()
     return rule_issues, nli_results
+
+
 def _build_report_text(question: str, answer: str, rule_issues, nli_results, final_summary: str = None) -> str:
     parts = [f"【問題】\n{question}", f"\n【回答】\n{answer}"]
     parts.append("\n【規則式查核】")
@@ -529,6 +630,8 @@ def _build_report_text(question: str, answer: str, rule_issues, nli_results, fin
         parts.append("\n【最終彙整總結(純程式邏輯依查核結果分組,未經任何 LLM 二次生成)】")
         parts.append(final_summary)
     return "\n".join(parts)
+
+
 def _summarize_final_answer(question: str, answer: str, rule_issues, nli_results) -> str:
     """
     最終彙整,改用【純程式邏輯組裝,不呼叫任何 LLM】。
@@ -540,8 +643,6 @@ def _summarize_final_answer(question: str, answer: str, rule_issues, nli_results
     這類錯誤 —— 不是「比較不會錯」,是這個步驟不再存在讓它出錯的空間。
     """
     if nli_results is None:
-        # 沒有逐句結果可用(NLI 未安裝或載入失敗),無法逐句分組,
-        # 只能附上原始回答 + 全域規則式查核結果,不假裝有能力篩選。
         if rule_issues:
             parts = [
                 "(NLI 查核未啟用,無法逐句判定,以下為原始回答,請自行比對規則式查核結果)",
@@ -570,6 +671,8 @@ def _summarize_final_answer(question: str, answer: str, rule_issues, nli_results
         parts.append("\n⚠️ 規則式查核在整體回答中另外發現以下問題:")
         parts.extend(f"- {issue}" for issue in rule_issues)
     return "\n".join(parts)
+
+
 def query_rag(index_file: str, mode: str, mode_label: str):
     """
     泛用版查詢函式,依 mode 分成「code」或「data」。
@@ -599,7 +702,6 @@ def query_rag(index_file: str, mode: str, mode_label: str):
         key=lambda x: x[0],
         reverse=True,
     )
-    # Stage 路徑過濾只在 code 模式下啟用,資料表格沒有 StageN 這種結構,不適用。
     path_keywords = []
     matched = []
     if mode == "code":
@@ -633,27 +735,23 @@ def query_rag(index_file: str, mode: str, mode_label: str):
     top_sim = top_k[0][0] if top_k else 0.0
     if top_sim < RAG_LOW_CONFIDENCE_MAX_SIM:
         print(f"\n⚠️ 提示:這次最高相似度只有 {top_sim:.3f},檢索到的片段跟問題關聯度偏低,回答可信度建議打折扣。")
-    # 檢索覆蓋度提示只在 code 模式下啟用(RAG_COVERAGE_HINTS 是針對 Django 專案檔名設計的)。
     if mode == "code":
         coverage_warnings = _check_coverage_hints(question, retrieved_files)
         if coverage_warnings:
             print("\n⚠️ 檢索覆蓋度提示:")
             for w in coverage_warnings:
                 print(f"  - {w}")
-    subject_desc = "程式碼片段" if mode == "code" else "資料表格內容(CSV)"
-    prompt = f"""你是{mode_label}問答助手。請嚴格根據下方提供的{subject_desc}用繁體中文回答問題,遵守以下規則:
-1. 只能根據片段裡「明確寫出的內容」回答,不可以用慣例、常見寫法或任何先驗知識去推測、補全片段中沒有寫的細節。
-2. 如果某個細節片段中沒有明確標註或說明,必須明確說出「片段中未標註/未提及此細節」,不可以自行猜測或假設。
-3. 用完整、自然的句子回答,把同一個主題的相關事實合併在同一句裡描述(例如「顧客是誰、商品是什麼、數量多少」合併成一句),不要把單一事實拆成好幾個短句、也不要在句子裡插入「(第X行)」這類行號標註——你回答時可以看到的片段本身已經標明來源檔案與行號範圍,不需要在答案文字裡逐句重複標注,這樣反而讓句子破碎不自然。
-4. 如果片段內容不足以完整回答問題,請先回答片段裡確定的部分,再明確指出哪部分找不到依據,不要為了讓回答看起來完整而編造內容。
-5. 絕對不要因為問題聽起來「應該」有某個答案,就假設片段裡一定有寫。沒看到就是沒看到。
-6. 如果問題涉及計算(例如加總、平均、篩選後計數),請根據片段裡的原始數值實際算過一遍再回答,不要憑印象估計。
-7. 不要額外加上「根據片段可知」「以上結果是根據片段內容得出」這類自我說明句;也不要在資訊已經完整回答時,還加一句「片段中未標註/未提及其他細節」當結尾——規則2是指「使用者問到的某個細節真的找不到時」才這樣說明,不是每次回答都要附加這句話。
-【問題】
-{question}
-【相關{subject_desc}】
-{context_text}
-"""
+    template_file = PROMPT_CODE_FILE if mode == "code" else PROMPT_DATA_FILE
+    try:
+        template = _load_prompt_template(template_file)
+    except FileNotFoundError as e:
+        print(f"⚠️ {e}")
+        return
+    try:
+        prompt = template.format(question=question, context_text=context_text)
+    except (KeyError, IndexError) as e:
+        print(f"⚠️ prompt 範本檔案 {template_file} 格式有誤(佔位字串應為 {{question}} 與 {{context_text}}):{e}")
+        return
     print("\n查詢本地模型中,請稍候...")
     resp = ollama.chat(model=LLM_MODEL, messages=[{'role': 'user', 'content': prompt}])
     answer = resp['message']['content']
@@ -668,17 +766,26 @@ def query_rag(index_file: str, mode: str, mode_label: str):
     if save == "y":
         ok = _copy_to_clipboard(report_text)
         print("已複製到剪貼簿(含查核結果與總結)" if ok else "複製失敗")
+
+
 def query_code_rag():
     """選項 10:針對「程式碼」RAG 索引提問。"""
     query_rag(RAG_INDEX_FILE, "code", "程式碼")
+
+
 def query_data_rag():
     """選項 11:針對「資料表格」RAG 索引提問。"""
     query_rag(RAG_DATA_INDEX_FILE, "data", "資料表格")
+
+
 def menu():
+    _ensure_dirs()
     while True:
-        print("""
+        print(f"""
 ========== Agent Project 助理 ==========
-1. 顯示資料夾結構(可指定路徑,留空為目前資料夾)
+(目標檔案資料夾: {FILES_DIR})
+(prompt 範本資料夾: {PROMPT_DIR})
+1. 顯示資料夾結構(可指定路徑,留空為 files/ 資料夾)
 2. 打包程式碼給 Claude(複製到剪貼簿)
 3. 用本地模型摘要整理(複製到剪貼簿)
 4. 從剪貼簿套用修改(Claude 回覆貼回後用)
@@ -720,5 +827,7 @@ def menu():
             sys.exit(0)
         else:
             print("無效選項")
+
+
 if __name__ == "__main__":
     menu()
