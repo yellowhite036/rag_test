@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 import ollama
 import ast
+import difflib
 # 事實查核用(選項 9 進階查核),非必要但強烈建議安裝:
 #   pip install transformers torch
 # 首次查核時會自動下載 NLI_MODEL 指定的模型(約數百 MB),請保持網路暢通。
@@ -218,6 +219,26 @@ def summarize_with_local_model():
     print(f"\n已存到 summary.txt")
     print("已複製到剪貼簿" if ok else "請手動打開 summary.txt 複製")
 
+def _show_diff(rel_path: str, new_content: str):
+    """
+    顯示單一檔案『修改前 → 修改後』的差異(unified diff格式)。
+    若檔案原本不存在(新建檔案),舊內容視為空字串。
+    """
+    target = FILES_DIR / rel_path
+    old_content = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+    diff_lines = list(difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=f"目前版本: {rel_path}",
+        tofile=f"修改後版本: {rel_path}",
+    ))
+    if diff_lines:
+        print(f"\n--- {rel_path} 的變更 ---")
+        for line in diff_lines:
+            print(line, end="" if line.endswith("\n") else "\n")
+    else:
+        print(f"\n--- {rel_path} 無變化 ---")    
+
 def _qa_gate(matches) -> tuple[bool, list[str]]:
     """
     写入前的确定性检查(目前只做语法检查)。
@@ -254,6 +275,14 @@ def _apply_matches(matches):
             print("已取消寫入")
             return
         print("⚠️ 已強制寫入,略過語法檢查結果")
+
+    print("\n========== 變更內容(diff)==========")
+    for rel_path, content in matches:
+        rel_path = rel_path.strip()
+        if Path(rel_path).name == SELF_FILE:
+            continue
+        _show_diff(rel_path, content)
+    print("=====================================")
 
     _flush_stdin()
     confirm = input("\n確認套用嗎?(y/n): ")
