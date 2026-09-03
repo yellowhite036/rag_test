@@ -239,9 +239,141 @@ def _show_diff(rel_path: str, new_content: str):
     else:
         print(f"\n--- {rel_path} 無變化 ---")    
 
+def _parse_spec(raw_instruction: str) -> dict:
+    """
+    簡單規格解析:如果剪貼簿內容包含【驗收條件】區塊就抽出來,
+    沒有的話驗收條件為空(退化成原本行為,但會提示)。
+    格式約定:
+        【需求】
+        ...(可省略,不寫也可以直接寫需求本身)
+        【驗收條件】
+        - ...
+        - ...
+    """
+    spec = {"requirement": raw_instruction.strip(), "acceptance": []}
+    m = re.search(r"【驗收條件】(.*)", raw_instruction, re.DOTALL)
+    if m:
+        spec["requirement"] = raw_instruction[:m.start()].strip()
+        # 把【需求】標籤本身去掉,只留需求內容
+        spec["requirement"] = re.sub(r"^【需求】\s*", "", spec["requirement"])
+        spec["acceptance"] = [
+            line.strip().lstrip("-").strip()
+            for line in m.group(1).splitlines()
+            if line.strip().startswith("-")
+        ]
+    if not spec["acceptance"]:
+        print("⚠️ 本次指令沒有附【驗收條件】,之後 QA 階段將只能做語法檢查,無法核對需求是否真正達成")
+    return spec
+
+def _clean_model_output(text: str) -> str:
+    """
+    確定性清理器:不依賴模型「這次有沒有乖乖照格式輸出」,
+    而是用固定規則把常見的格式偏差修正回程式要求的樣子。
+    處理兩類常見狀況:
+    1. 模型把整段包進 Markdown code fence(```python ... ```)
+    2. 模型漏打 FILE_START/FILE_END 前後的 ##### 符號
+    """
+    cleaned = text.strip()
+
+    # 1) 剝除最外層的 code fence(``` 或 ```python 開頭,``` 結尾)
+    fence_pattern = re.compile(r'^```[a-zA-Z]*\n(.*)\n```$', re.DOTALL)
+    m = fence_pattern.match(cleaned)
+    if m:
+        cleaned = m.group(1).strip()
+
+    # 2) 若已經有正確的 ##### FILE_START 格式,直接回傳
+    if PATTERN.search(cleaned):
+        return cleaned
+
+    # 3) 嘗試修補「裸 FILE_START / FILE_END」(沒有 ##### 包住)
+    #    寬鬆抓法:FILE_START 後面可能直接接檔名,或換行後才是內容
+    loose_pattern = re.compile(
+        r'FILE_START[:\s]*([^\n]*)\n(.*?)\nFILE_END',
+        re.DOTALL
+    )
+    loose_matches = loose_pattern.findall(cleaned)
+    if loose_matches:
+        rebuilt_blocks = []
+        for rel_path, content in loose_matches:
+            rel_path = rel_path.strip().strip(":").strip()
+            rebuilt_blocks.append(
+                f"##### FILE_START: {rel_path} #####\n{content.strip()}\n##### FILE_END #####"
+            )
+        cleaned = "\n\n".join(rebuilt_blocks)
+
+    return cleaned
+
+
+def _validate_matches(matches, known_files) -> list:
+    """
+    確定性驗證:檢查解析出來的檔名是否合理,
+    避免模型幻覺出一個不存在、也不像是合理新檔案的路徑。
+    known_files 是目前 files/ 底下已存在的相對路徑字串集合。
+    回傳問題清單(空清單代表沒問題)。
+    """
+    problems = []
+    for rel_path, _ in matches:
+        rel_path = rel_path.strip()
+        if not rel_path:
+            problems.append("出現空白檔名")
+            continue
+        if rel_path not in known_files and not rel_path.endswith(".py"):
+            problems.append(f"可疑檔名(不存在且副檔名不是 .py):{rel_path}")
+        if ".." in rel_path:
+            problems.append(f"可疑檔名(包含 .. 路徑跳脫):{rel_path}")
+    return problems
+
+
+def _extract_function_names(content: str) -> set:
+    """
+    確定性檢查用:從一段 Python 原始碼裡,用 ast 抓出所有函式定義的名稱
+    (包含巢狀函式、class 裡的 method、async def)。
+    語法有錯時直接回傳空集合,交給 _qa_gate 的語法檢查那關去擋,
+    這裡不重複判斷語法對錯,只單純負責「函式名稱清單」這件事。
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+    return names
+
+
+def _check_missing_functions(rel_path: str, new_content: str) -> list:
+    """
+    確定性檢查:比對「修改前」與「修改後」的函式名稱清單,
+    找出修改前存在、修改後卻消失的函式。
+    這一關存在的原因是:語法合法(ast.parse 通過)不代表內容正確,
+    模型完全可能只回傳一部分函式(例如只回傳被要求修改的那個函式),
+    導致其他函式被整批砍掉,但因為剩下的程式碼語法依然合法,
+    純語法檢查完全抓不到這種問題。
+    回傳問題清單(空清單代表沒有函式無故消失)。
+    """
+    problems = []
+    target = FILES_DIR / rel_path
+    if not target.exists():
+        # 新檔案,沒有「修改前」可比對,不做這項檢查
+        return problems
+    old_content = target.read_text(encoding="utf-8", errors="replace")
+    old_funcs = _extract_function_names(old_content)
+    new_funcs = _extract_function_names(new_content)
+    missing = sorted(old_funcs - new_funcs)
+    if missing:
+        problems.append(
+            f"{rel_path}: 以下函式在修改前存在,修改後卻消失,"
+            f"可能是模型只回傳部分內容導致誤刪:{', '.join(missing)}"
+        )
+    return problems
+
+
 def _qa_gate(matches) -> tuple[bool, list[str]]:
     """
-    写入前的确定性检查(目前只做语法检查)。
+    写入前的确定性检查。目前包含两层:
+    1. 语法检查(ast.parse 能否成功解析)
+    2. 函式存在性检查(修改前存在的函式,修改后是否无故消失)
     返回 (是否全部通过, 问题清单)。任何一项不过,调用方应拒绝写入。
     """
     problems = []
@@ -255,10 +387,12 @@ def _qa_gate(matches) -> tuple[bool, list[str]]:
             ast.parse(content, filename=rel_path)
         except SyntaxError as e:
             problems.append(f"{rel_path}: 语法错误 (行 {e.lineno}): {e.msg}")
+            continue  # 語法都不合法了,函式比對沒有意義,跳過
+        problems.extend(_check_missing_functions(rel_path, content))
     return (len(problems) == 0), problems
 
 
-def _apply_matches(matches):
+def _apply_matches(matches, acceptance=None):
     print(f"\n偵測到 {len(matches)} 個檔案異動:")
     for rel_path, _ in matches:
         flag = "  ⚠️ 將被跳過(工具自身檔案,受保護)" if Path(rel_path.strip()).name == SELF_FILE else ""
@@ -266,7 +400,7 @@ def _apply_matches(matches):
 
     passed, problems = _qa_gate(matches)
     if not passed:
-        print("\n🚨 QA Gate 未通過(語法檢查失敗),拒絕寫入:")
+        print("\n🚨 QA Gate 未通過,拒絕寫入:")
         for p in problems:
             print(f"  - {p}")
         _flush_stdin()
@@ -274,7 +408,7 @@ def _apply_matches(matches):
         if override != "FORCE":
             print("已取消寫入")
             return
-        print("⚠️ 已強制寫入,略過語法檢查結果")
+        print("⚠️ 已強制寫入,略過 QA Gate 檢查結果")
 
     print("\n========== 變更內容(diff)==========")
     for rel_path, content in matches:
@@ -285,6 +419,10 @@ def _apply_matches(matches):
     print("=====================================")
 
     _flush_stdin()
+    if acceptance:
+        print("\n📋 本次修改應滿足以下驗收條件(請對照上方 diff 自行確認):")
+        for c in acceptance:
+            print(f"  - {c}")
     confirm = input("\n確認套用嗎?(y/n): ")
     if confirm.lower() != "y":
         print("已取消")
@@ -318,39 +456,104 @@ def auto_edit_with_local_model():
     if "FILE_START" in instruction or "FILE_END" in instruction:
         print("警告:指令內容包含 FILE_START/FILE_END 字樣,可能干擾解析,建議修改指令內容後再試")
         return
-    print(f"\n讀到的指令:\n{instruction}\n")
+
+    spec = _parse_spec(instruction)
+    print(f"\n讀到的需求:\n{spec['requirement']}\n")
+    if spec["acceptance"]:
+        print("讀到的驗收條件:")
+        for c in spec["acceptance"]:
+            print(f"  - {c}")
+        print()
+
     _flush_stdin()
     confirm = input("確認用這段指令執行嗎?(y/n): ")
     if confirm.lower() != "y":
         print("已取消")
         return
+
     blocks = []
+    known_files = set()
     for f in _files(DEFAULT_EXT):
         rel = f.relative_to(FILES_DIR)
+        known_files.add(str(rel))
         content = f.read_text(encoding="utf-8", errors="replace")
         blocks.append(f"##### FILE_START: {rel} #####\n{content}\n##### FILE_END #####")
     files_text = "\n\n".join(blocks)
-    prompt = f"""你是程式碼修改助手。請根據下方【指示開始】到【指示結束】之間的內容修改檔案,並【務必】用完全相同的 FILE_START/FILE_END 格式回覆每個檔案(不論有無修改),不要加任何額外說明。
+
+    base_prompt = f"""你是程式碼修改助手。請根據下方【指示開始】到【指示結束】之間的內容修改檔案,並【務必】用完全相同的 FILE_START/FILE_END 格式回覆每個檔案(不論有無修改),不要加任何額外說明。
 【指示開始】
-{instruction}
+{spec['requirement']}
 【指示結束】
 以下是檔案內容,只有 FILE_START/FILE_END 標記之間的內容才是檔案內容,不要把上面的指示誤認為是檔案內容:
 {files_text}
+
+輸出格式範例(請完全照抄這個格式,只替換檔名與內容,不要使用任何 Markdown 語法,不要用三個反引號包裹輸出):
+##### FILE_START: example.py #####
+def example():
+    pass
+##### FILE_END #####
+
+再次強調:
+1. 每個檔案都必須用「##### FILE_START: 檔名 #####」開頭、「##### FILE_END #####」結尾,前後都是五個 # 號,不可省略,也不可包在 Markdown code fence 裡。
+2. 每個回傳的檔案必須是「完整內容」,包含所有原本就存在、這次沒有要求修改的函式,不可以只回傳被要求修改的那個函式,不可以省略或截斷任何其他函式。
 """
-    print(f"傳送給本地模型修改中(prompt 共 {len(prompt)} 字元),請稍候...")
-    Path("debug_last_prompt.txt").write_text(prompt, encoding="utf-8")
-    resp = ollama.chat(
-        model=LLM_MODEL,
-        messages=[{'role': 'user', 'content': prompt}],
-        options={"num_ctx": 16384},
-    )
-    result = resp['message']['content']
-    matches = PATTERN.findall(result)
-    if not matches:
-        print("模型回覆格式不符,無法套用。前 500 字:")
-        print(result[:500])
-        return
-    _apply_matches(matches)
+
+    MAX_RETRIES = 3
+    prompt = base_prompt
+    matches = []
+    result = ""
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"\n傳送給本地模型修改中(第 {attempt}/{MAX_RETRIES} 次嘗試,prompt 共 {len(prompt)} 字元),請稍候...")
+        Path("debug_last_prompt.txt").write_text(prompt, encoding="utf-8")
+        resp = ollama.chat(
+            model=LLM_MODEL,
+            messages=[{'role': 'user', 'content': prompt}],
+            options={"num_ctx": 16384, "temperature": 0},
+        )
+        result = resp['message']['content']
+
+        # 確定性清理:先修補常見格式偏差,再交給正則解析
+        cleaned = _clean_model_output(result)
+        matches = PATTERN.findall(cleaned)
+
+        if matches:
+            # 格式解析成功,再做一層確定性驗證(檔名合理性)
+            validity_problems = _validate_matches(matches, known_files)
+            if not validity_problems:
+                # 額外做一次「函式是否無故消失」的預檢查,提前發現就提前重試,
+                # 不用等到 _apply_matches 裡的 _qa_gate 才發現、才要求使用者手動處理
+                missing_problems = []
+                for rel_path, content in matches:
+                    rel_path_stripped = rel_path.strip()
+                    if rel_path_stripped.endswith(".py") and Path(rel_path_stripped).name != SELF_FILE:
+                        missing_problems.extend(_check_missing_functions(rel_path_stripped, content))
+                if not missing_problems:
+                    break
+                else:
+                    print("⚠️ 解析成功但偵測到函式疑似被誤刪:")
+                    for p in missing_problems:
+                        print(f"  - {p}")
+                    matches = []  # 視為本次嘗試失敗,進入重試
+            else:
+                print("⚠️ 解析成功但檔名驗證失敗:")
+                for p in validity_problems:
+                    print(f"  - {p}")
+                matches = []  # 視為本次嘗試失敗,進入重試
+
+        if attempt < MAX_RETRIES:
+            print(f"⚠️ 第 {attempt} 次嘗試不符合要求,將附上錯誤內容要求模型重新輸出...")
+            prompt = base_prompt + f"""
+
+【上一次你的輸出如下,不符合要求(格式錯誤或遺漏了部分函式),請重新輸出完整內容,務必嚴格遵守上面的格式範例,並確保每個檔案都是完整內容】
+{result[:1000]}
+"""
+        else:
+            print(f"\n已重試 {MAX_RETRIES} 次仍無法取得正確結果,放棄本次修改。模型最後一次回覆前 500 字:")
+            print(result[:500])
+            return
+
+    _apply_matches(matches, acceptance=spec["acceptance"])
 
 
 def extract_relevant_code_with_local_model():
