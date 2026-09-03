@@ -1,0 +1,16 @@
+# 忽略所有 JSON 檔案（例如 url_history.json 這類本機紀錄檔，不該進版控）
+*.json
+
+# 除錯用的頁面快照
+debug_dumps/
+
+# Python
+__pycache__/
+*.pyc
+
+# Chrome 使用者資料目錄（如果專案資料夾內有建立）
+chrome_debug_inline_v2/
+
+# PyInstaller / Build
+dist/
+build/

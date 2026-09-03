@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 from datetime import datetime
 import ollama
+import ast
 # 事實查核用(選項 9 進階查核),非必要但強烈建議安裝:
 #   pip install transformers torch
 # 首次查核時會自動下載 NLI_MODEL 指定的模型(約數百 MB),請保持網路暢通。
@@ -154,16 +155,48 @@ def show_structure():
     print()
 
 
+# 建議視為文字檔可安全讀取的副檔名(可依需求增減)
+TEXT_EXT_WHITELIST = {
+    ".py", ".csv", ".txt", ".md", ".json", ".yaml", ".yml",
+    ".html", ".css", ".js", ".ts", ".sh", ".ini", ".cfg", ".toml",
+}
+
+
+def _all_files(folder=None):
+    """掃描目標檔案資料夾(預設 FILES_DIR)裡的『所有』檔案,不限副檔名。"""
+    folder = folder or FILES_DIR
+    files = [f for f in folder.rglob("*") if f.is_file()]
+    return [
+        f for f in files
+        if ".backup" not in str(f)
+        and "__pycache__" not in str(f)
+        and f.name != SELF_FILE
+    ]
+
+
 def collect_for_claude():
     blocks = []
-    for f in _files(DEFAULT_EXT):
+    skipped = []
+    for f in _all_files():
         rel = f.relative_to(FILES_DIR)
-        content = f.read_text(encoding="utf-8", errors="replace")
+        if f.suffix.lower() not in TEXT_EXT_WHITELIST:
+            # 非白名單副檔名,嘗試讀取但抓例外,避免整個流程中斷
+            try:
+                content = f.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, ValueError):
+                skipped.append(str(rel))
+                continue
+        else:
+            content = f.read_text(encoding="utf-8", errors="replace")
         blocks.append(f"##### FILE_START: {rel} #####\n{content}\n##### FILE_END #####")
     text = "\n\n".join(blocks)
     Path("collected.txt").write_text(text, encoding="utf-8")
     ok = _copy_to_clipboard(text)
-    print(f"\n已整理 {len(text)} 字元 → collected.txt")
+    print(f"\n已整理 {len(blocks)} 個檔案,共 {len(text)} 字元 → collected.txt")
+    if skipped:
+        print(f"以下檔案疑似為二進位檔,已跳過:")
+        for s in skipped:
+            print(f"  - {s}")
     print("已複製到剪貼簿,可直接貼給 Claude" if ok else "請手動打開 collected.txt 複製")
 
 
@@ -185,12 +218,43 @@ def summarize_with_local_model():
     print(f"\n已存到 summary.txt")
     print("已複製到剪貼簿" if ok else "請手動打開 summary.txt 複製")
 
+def _qa_gate(matches) -> tuple[bool, list[str]]:
+    """
+    写入前的确定性检查(目前只做语法检查)。
+    返回 (是否全部通过, 问题清单)。任何一项不过,调用方应拒绝写入。
+    """
+    problems = []
+    for rel_path, content in matches:
+        rel_path = rel_path.strip()
+        if Path(rel_path).name == SELF_FILE:
+            continue
+        if not rel_path.endswith(".py"):
+            continue  # 非 .py 文件(例如未来若支持其他格式)不做语法检查
+        try:
+            ast.parse(content, filename=rel_path)
+        except SyntaxError as e:
+            problems.append(f"{rel_path}: 语法错误 (行 {e.lineno}): {e.msg}")
+    return (len(problems) == 0), problems
+
 
 def _apply_matches(matches):
     print(f"\n偵測到 {len(matches)} 個檔案異動:")
     for rel_path, _ in matches:
         flag = "  ⚠️ 將被跳過(工具自身檔案,受保護)" if Path(rel_path.strip()).name == SELF_FILE else ""
         print(f"  - {rel_path.strip()}{flag}")
+
+    passed, problems = _qa_gate(matches)
+    if not passed:
+        print("\n🚨 QA Gate 未通過(語法檢查失敗),拒絕寫入:")
+        for p in problems:
+            print(f"  - {p}")
+        _flush_stdin()
+        override = input("\n仍要強制寫入嗎?(不建議,輸入 FORCE 才會執行,其他任意輸入=取消): ").strip()
+        if override != "FORCE":
+            print("已取消寫入")
+            return
+        print("⚠️ 已強制寫入,略過語法檢查結果")
+
     _flush_stdin()
     confirm = input("\n確認套用嗎?(y/n): ")
     if confirm.lower() != "y":
@@ -212,15 +276,6 @@ def _apply_matches(matches):
         target.write_text(content, encoding="utf-8")
         print(f"已更新:{rel_path}")
     print(f"備份於:{backup_dir}")
-
-
-def apply_from_clipboard():
-    text = _read_clipboard()
-    matches = PATTERN.findall(text)
-    if not matches:
-        print("剪貼簿內容沒有符合 FILE_START/FILE_END 格式,取消套用")
-        return
-    _apply_matches(matches)
 
 
 def auto_edit_with_local_model():
@@ -777,6 +832,233 @@ def query_data_rag():
     """選項 11:針對「資料表格」RAG 索引提問。"""
     query_rag(RAG_DATA_INDEX_FILE, "data", "資料表格")
 
+def _simple_rag_retrieve(question, top_k=5):
+    """
+    簡化版 RAG：
+    不使用 embedding / vector database，
+    直接掃描 files/ 底下的 .py，使用關鍵字出現次數排序。
+    """
+    files = _files(DEFAULT_EXT)
+
+    if not files:
+        return []
+
+    # 將問題切成關鍵字
+    question_tokens = [
+        token.lower()
+        for token in re.findall(r'[\w\u4e00-\u9fff]+', question)
+        if len(token.strip()) >= 2
+    ]
+
+    scored = []
+
+    for f in files:
+        try:
+            content = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        content_lower = content.lower()
+        score = 0
+
+        # 檔名命中給較高權重
+        filename_lower = f.name.lower()
+        for token in question_tokens:
+            if token in filename_lower:
+                score += 5
+
+        # 內容關鍵字命中
+        for token in question_tokens:
+            score += content_lower.count(token)
+
+        if score > 0:
+            scored.append((score, f, content))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    results = []
+
+    for score, f, content in scored[:top_k]:
+        results.append({
+            "file": str(f.relative_to(FILES_DIR)),
+            "score": score,
+            "text": content,
+        })
+
+    return results
+
+
+def simple_rag_llm_fallback():
+    """
+    選項 12：
+    簡化版 RAG + LLM fallback。
+
+    1. 先使用關鍵字從 files/*.py 找相關檔案
+    2. 找到資料後交給 Ollama LLM
+    3. LLM 呼叫失敗時，直接使用檢索內容作為 fallback
+    """
+    _flush_stdin()
+
+    question = input("請輸入你想查詢的問題: ").strip()
+
+    if not question:
+        print("問題是空的，取消操作")
+        return
+
+    print("\n=== 簡化版 RAG 檢索中 ===")
+
+    retrieved = _simple_rag_retrieve(question, top_k=5)
+
+    if not retrieved:
+        print("找不到與問題相關的程式碼內容。")
+        print("\n=== Fallback ===")
+        print("目前沒有足夠的資料可以回答這個問題。")
+        return
+
+    print(f"找到 {len(retrieved)} 個相關檔案：")
+
+    context_blocks = []
+
+    for item in retrieved:
+        print(f"  [{item['score']}] {item['file']}")
+
+        context_blocks.append(
+            f"# 檔案：{item['file']}\n"
+            f"{item['text']}"
+        )
+
+    context_text = "\n\n".join(context_blocks)
+
+    print("\n=== 檢索到的 Context ===")
+
+    for item in retrieved:
+        print(
+            f"\n--- {item['file']} "
+            f"(score={item['score']}) ---"
+        )
+        print(item["text"][:1000])
+
+    prompt = f"""
+你是一個程式碼分析助手。
+
+請根據下面檢索到的程式碼內容回答使用者問題。
+
+規則：
+1. 只能根據提供的 Context 回答。
+2. 不要自行捏造不存在的程式碼。
+3. 如果 Context 沒有足夠資訊，請明確說明。
+4. 使用繁體中文。
+5. 優先直接回答問題。
+6. 可以指出相關檔案名稱。
+
+【Context】
+{context_text}
+
+【使用者問題】
+{question}
+"""
+
+    print("\n=== 呼叫 LLM ===")
+
+    try:
+        resp = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        answer = resp["message"]["content"].strip()
+
+        if answer:
+            print("\n=== LLM 回答 ===")
+            print(answer)
+            return
+
+        raise RuntimeError("LLM 沒有回傳內容")
+
+    except Exception as e:
+        print(f"LLM 呼叫失敗：{e}")
+
+        print("\n=== LLM Fallback ===")
+        print("無法使用 LLM，以下直接提供檢索到的相關內容：")
+
+        for item in retrieved:
+            print(
+                f"\n--- {item['file']} "
+                f"(相關度 score={item['score']}) ---"
+            )
+            print(item["text"])
+
+def simple_csv_rag():
+    question = input("請輸入你想查詢的問題: ").strip()
+
+    if not question:
+        print("沒有輸入問題。")
+        return
+
+    print("\n=== 簡化版 CSV RAG 檢索中 ===")
+
+    csv_files = _files([".csv"])
+
+    if not csv_files:
+        print("找不到 CSV 檔案。")
+        return
+
+    # 詢問資料筆數
+    if any(keyword in question for keyword in [
+        "幾個",
+        "多少",
+        "幾筆",
+        "數量",
+        "筆數",
+        "訂單數"
+    ]):
+        total = 0
+
+        for path in csv_files:
+            try:
+                import csv
+
+                with path.open(
+                    "r",
+                    encoding="utf-8-sig",
+                    newline=""
+                ) as f:
+                    rows = list(csv.reader(f))
+
+                count = max(0, len(rows) - 1)
+
+                print(f"{path}: {count} 筆")
+
+                total += count
+
+            except Exception as e:
+                print(f"讀取 {path} 失敗: {e}")
+
+        print(f"\n總資料筆數: {total}")
+
+        if "訂單" in question:
+            print(f"答案：共有 {total} 筆訂單。")
+        else:
+            print(f"答案：共有 {total} 筆資料。")
+
+        return
+
+    # 其他 CSV 問題
+    print("\n=== CSV 檔案 ===")
+
+    for path in csv_files:
+        print(path)
+
+    print("\n目前簡化版 CSV RAG 主要支援資料筆數統計。")
+
+
+
+
 
 def menu():
     _ensure_dirs()
@@ -788,14 +1070,15 @@ def menu():
 1. 顯示資料夾結構(可指定路徑,留空為 files/ 資料夾)
 2. 打包程式碼給 Claude(複製到剪貼簿)
 3. 用本地模型摘要整理(複製到剪貼簿)
-4. 從剪貼簿套用修改(Claude 回覆貼回後用)
-5. 用本地模型直接修改(貼 Claude 生成的指令)
-6. 用本地模型整理需要修改部份的完整程式碼(貼 Claude 說明後用)
-7. 修改完把程式貼回 Claude 檢查
-8. 建立/更新「程式碼」RAG 索引 (.py)
-9. 建立/更新「資料表格」RAG 索引 (.csv)
-10. 用 RAG 提問查詢「程式碼」(含規則式+NLI雙重查核 + 純程式彙整,不額外呼叫LLM)
-11. 用 RAG 提問查詢「資料表格」(含規則式+NLI雙重查核 + 純程式彙整,不額外呼叫LLM)
+4. 用本地模型直接修改(貼 Claude 生成的指令)
+5. 用本地模型整理需要修改部份的完整程式碼(貼 Claude 說明後用)
+6. 修改完把程式貼回 Claude 檢查
+7. 建立/更新「程式碼」RAG 索引 (.py)
+8. 建立/更新「資料表格」RAG 索引 (.csv)
+9. 用 RAG 提問查詢「程式碼」(含規則式+NLI雙重查核 + 純程式彙整,不額外呼叫LLM)
+10. 用 RAG 提問查詢「資料表格」(含規則式+NLI雙重查核 + 純程式彙整,不額外呼叫LLM)
+11. 簡化版 RAG + LLM fallback
+12. 簡化版「資料表格」RAG + CSV 計算
 0. 離開
 =========================================
 """)
@@ -808,21 +1091,23 @@ def menu():
         elif choice == "3":
             summarize_with_local_model()
         elif choice == "4":
-            apply_from_clipboard()
-        elif choice == "5":
             auto_edit_with_local_model()
-        elif choice == "6":
+        elif choice == "5":
             extract_relevant_code_with_local_model()
-        elif choice == "7":
+        elif choice == "6":
             review_with_claude()
-        elif choice == "8":
+        elif choice == "7":
             build_code_index()
-        elif choice == "9":
+        elif choice == "8":
             build_data_index()
-        elif choice == "10":
+        elif choice == "9":
             query_code_rag()
-        elif choice == "11":
+        elif choice == "10":
             query_data_rag()
+        elif choice == "11":
+            simple_rag_llm_fallback()   
+        elif choice == "12":
+            simple_csv_rag()     
         elif choice == "0":
             sys.exit(0)
         else:
