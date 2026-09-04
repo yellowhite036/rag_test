@@ -2,7 +2,6 @@
 import subprocess
 import re
 import sys
-import termios
 import json
 import math
 from pathlib import Path
@@ -10,9 +9,23 @@ from datetime import datetime
 import ollama
 import ast
 import difflib
+
+try:
+    import termios
+except ImportError:
+    termios = None  # Windows 沒有 termios,略過即可
+
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None  # 尚未安裝時,剪貼簿功能會提示安裝
+
 # 事實查核用(選項 9 進階查核),非必要但強烈建議安裝:
 #   pip install transformers torch
 # 首次查核時會自動下載 NLI_MODEL 指定的模型(約數百 MB),請保持網路暢通。
+#
+# 剪貼簿功能需要:
+#   pip install pyperclip
 
 # === 資料夾結構 ===
 # ./agent.py            <- 本程式
@@ -33,7 +46,7 @@ PROMPT_DATA_FILE = PROMPT_DIR / "prompt_data.txt"   # 資料表格問答模式�
 RAG_CHUNK_LINES = 60      # 每個索引片段的行數
 RAG_CHUNK_OVERLAP = 10    # 片段之間重疊的行數,避免切在函式中間找不到上下文
 RAG_TOP_K = 8             # 查詢時取最相關的幾個片段
-RAG_MIN_SIMILARITY = 0.4  # 相似度低於此門檻的片段不採用,避免湊數稀釋上下文
+RAG_MIN_SIMILARITY = 0.55  # 相似度低於此門檻的片段不採用,避免湊數稀釋上下文
 RAG_LOW_CONFIDENCE_MAX_SIM = 0.5  # 若本次 top-k 裡最高分都低於這個值,提示回答可信度可能偏低
 # 偵測問題裡是否有「路徑式關鍵字」的正則表達式:StageN(不分大小寫,例如 stage3、Stage3、STAGE 3)
 _STAGE_KEYWORD_RE = re.compile(r'stage\s*([1-9])', re.IGNORECASE)
@@ -70,6 +83,10 @@ def _ensure_dirs():
 
 
 def _flush_stdin():
+    """清空終端機輸入緩衝區,避免殘留字元干擾下一次 input()。
+    Windows 沒有 termios,直接略過即可(Windows 的 input() 不受影響)。"""
+    if termios is None:
+        return
     try:
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
     except Exception:
@@ -86,19 +103,25 @@ def _files(ext_list, folder=None):
 
 
 def _copy_to_clipboard(text: str) -> bool:
+    if pyperclip is None:
+        print("尚未安裝 pyperclip,無法複製到剪貼簿。請執行:pip install pyperclip")
+        return False
     try:
-        subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), check=True)
+        pyperclip.copy(text)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"複製到剪貼簿失敗:{e}")
         return False
 
 
 def _read_clipboard() -> str:
+    if pyperclip is None:
+        print("尚未安裝 pyperclip,無法讀取剪貼簿。請執行:pip install pyperclip")
+        return ""
     try:
-        result = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, text=True, check=True)
-        return result.stdout
+        return pyperclip.paste()
     except Exception as e:
-        print(f"讀取剪貼簿失敗:{e}(請確認已安裝 xclip)")
+        print(f"讀取剪貼簿失敗:{e}")
         return ""
 
 
@@ -643,7 +666,7 @@ def _cosine_sim(a, b):
     return dot / (na * nb)
 
 
-def build_rag_index(ext_list, index_file, mode_label):
+def build_rag_index(ext_list, index_file, mode_label, chunk_lines=None, overlap_lines=None):
     """
     建立/更新 RAG 索引(泛用版,可用於程式碼或資料表格)。
     把 files/ 資料夾內符合 ext_list 副檔名的檔案切成片段,逐片段呼叫 Ollama 的
@@ -659,7 +682,11 @@ def build_rag_index(ext_list, index_file, mode_label):
     for f in files:
         rel = str(f.relative_to(FILES_DIR))
         content = f.read_text(encoding="utf-8", errors="replace")
-        chunks = _chunk_text(content)
+        chunks = _chunk_text(
+            content,
+            chunk_lines=chunk_lines or RAG_CHUNK_LINES,
+            overlap_lines=overlap_lines or RAG_CHUNK_OVERLAP
+        )
         print(f"  {rel}: {len(chunks)} 個片段")
         for start, end, piece in chunks:
             embed_input = f"檔案路徑: {rel}\n\n{piece}"
@@ -695,8 +722,13 @@ def build_code_index():
 
 def build_data_index():
     """選項 9:建立/更新「資料表格」RAG 索引(只吃 files/ 底下的 .csv)。"""
-    build_rag_index(DATA_EXT, RAG_DATA_INDEX_FILE, "資料表格")
-
+    build_rag_index(
+        DATA_EXT,
+        RAG_DATA_INDEX_FILE,
+        "資料表格",
+        chunk_lines=20,      # 資料表格用較小片段
+        overlap_lines=5
+    )
 
 def _load_rag_index(index_file):
     index_path = FOLDER / index_file
@@ -822,7 +854,7 @@ def _get_nli_pipeline():
         return None
     print(f"首次使用 NLI 查核,載入模型 {NLI_MODEL}(需要網路下載,請稍候)...")
     try:
-        _nli_pipeline = pipeline("text-classification", model=NLI_MODEL, top_k=None)
+        _nli_pipeline = pipeline("text-classification", model=NLI_MODEL, top_k=None, device=0)
     except Exception as e:
         print(f"⚠️ NLI 模型載入失敗,查核將略過:{e}")
         _nli_pipeline = False
@@ -1066,9 +1098,9 @@ def query_data_rag():
 
 def _simple_rag_retrieve(question, top_k=5):
     """
-    簡化版 RAG：
-    不使用 embedding / vector database，
-    直接掃描 files/ 底下的 .py，使用關鍵字出現次數排序。
+    簡化版 RAG:
+    不使用 embedding / vector database,
+    直接掃描 files/ 底下的 .py,使用關鍵字出現次數排序。
     """
     files = _files(DEFAULT_EXT)
 
@@ -1122,19 +1154,19 @@ def _simple_rag_retrieve(question, top_k=5):
 
 def simple_rag_llm_fallback():
     """
-    選項 12：
+    選項 12:
     簡化版 RAG + LLM fallback。
 
     1. 先使用關鍵字從 files/*.py 找相關檔案
     2. 找到資料後交給 Ollama LLM
-    3. LLM 呼叫失敗時，直接使用檢索內容作為 fallback
+    3. LLM 呼叫失敗時,直接使用檢索內容作為 fallback
     """
     _flush_stdin()
 
     question = input("請輸入你想查詢的問題: ").strip()
 
     if not question:
-        print("問題是空的，取消操作")
+        print("問題是空的,取消操作")
         return
 
     print("\n=== 簡化版 RAG 檢索中 ===")
@@ -1147,7 +1179,7 @@ def simple_rag_llm_fallback():
         print("目前沒有足夠的資料可以回答這個問題。")
         return
 
-    print(f"找到 {len(retrieved)} 個相關檔案：")
+    print(f"找到 {len(retrieved)} 個相關檔案:")
 
     context_blocks = []
 
@@ -1155,7 +1187,7 @@ def simple_rag_llm_fallback():
         print(f"  [{item['score']}] {item['file']}")
 
         context_blocks.append(
-            f"# 檔案：{item['file']}\n"
+            f"# 檔案:{item['file']}\n"
             f"{item['text']}"
         )
 
@@ -1175,10 +1207,10 @@ def simple_rag_llm_fallback():
 
 請根據下面檢索到的程式碼內容回答使用者問題。
 
-規則：
+規則:
 1. 只能根據提供的 Context 回答。
 2. 不要自行捏造不存在的程式碼。
-3. 如果 Context 沒有足夠資訊，請明確說明。
+3. 如果 Context 沒有足夠資訊,請明確說明。
 4. 使用繁體中文。
 5. 優先直接回答問題。
 6. 可以指出相關檔案名稱。
@@ -1213,10 +1245,10 @@ def simple_rag_llm_fallback():
         raise RuntimeError("LLM 沒有回傳內容")
 
     except Exception as e:
-        print(f"LLM 呼叫失敗：{e}")
+        print(f"LLM 呼叫失敗:{e}")
 
         print("\n=== LLM Fallback ===")
-        print("無法使用 LLM，以下直接提供檢索到的相關內容：")
+        print("無法使用 LLM,以下直接提供檢索到的相關內容:")
 
         for item in retrieved:
             print(
@@ -1274,9 +1306,9 @@ def simple_csv_rag():
         print(f"\n總資料筆數: {total}")
 
         if "訂單" in question:
-            print(f"答案：共有 {total} 筆訂單。")
+            print(f"答案:共有 {total} 筆訂單。")
         else:
-            print(f"答案：共有 {total} 筆資料。")
+            print(f"答案:共有 {total} 筆資料。")
 
         return
 
