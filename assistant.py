@@ -10,6 +10,8 @@ import ollama
 import ast
 import difflib
 
+from pipeline import run_edit_pipeline
+
 try:
     import termios
 except ImportError:
@@ -38,6 +40,7 @@ FILES_DIR = FOLDER / "files"          # 目標檔案資料夾(程式碼 / 資料
 DEFAULT_EXT = [".py"]        # 程式碼索引專用副檔名
 DATA_EXT = [".csv"]          # 資料表格索引專用副檔名(跟程式碼分開,避免混在一起)
 LLM_MODEL = "qwen2.5:7b-instruct-q4_K_M"
+SPEC_MODEL = "qwen2.5:3b-instruct-q4_K_M"        # 資料表格 / 指令解析(prompt_data.txt)
 EMBED_MODEL = "nomic-embed-text"  # 需先用 `ollama pull nomic-embed-text` 下載
 RAG_INDEX_FILE = "rag_index.json"           # 程式碼索引檔(存在 FOLDER 底下)
 RAG_DATA_INDEX_FILE = "rag_data_index.json"  # 資料表格索引檔(獨立檔案,不會互相覆蓋)
@@ -469,6 +472,15 @@ def _apply_matches(matches, acceptance=None):
 
 
 def auto_edit_with_local_model():
+    """
+    【已升級】呼叫 4-Agent pipeline：
+        SpecAgent → CoderAgent → CleanerAgent → QAAgent
+
+    舊的「單模型 + 重試 3 次（context 累積膨脹）」已替換成：
+    - 每個 Agent 只做一件事
+    - 重試時只重跑 CoderAgent（context 固定大小，不累積上次輸出）
+    - QA 新增 L3（import 消失）、L4（複雜度上升警告）、L5（py_compile）
+    """
     print("請先把修改指令『複製』到剪貼簿(不要直接貼在這個終端機視窗裡),完成後回到這裡按一下 Enter 繼續...")
     input()
     _flush_stdin()
@@ -480,103 +492,22 @@ def auto_edit_with_local_model():
         print("警告:指令內容包含 FILE_START/FILE_END 字樣,可能干擾解析,建議修改指令內容後再試")
         return
 
-    spec = _parse_spec(instruction)
-    print(f"\n讀到的需求:\n{spec['requirement']}\n")
-    if spec["acceptance"]:
-        print("讀到的驗收條件:")
-        for c in spec["acceptance"]:
-            print(f"  - {c}")
-        print()
-
-    _flush_stdin()
-    confirm = input("確認用這段指令執行嗎?(y/n): ")
-    if confirm.lower() != "y":
-        print("已取消")
+    py_files = _files(DEFAULT_EXT)
+    if not py_files:
+        print(f"在 {FILES_DIR} 裡找不到可修改的 .py 檔案")
         return
 
-    blocks = []
-    known_files = set()
-    for f in _files(DEFAULT_EXT):
-        rel = f.relative_to(FILES_DIR)
-        known_files.add(str(rel))
-        content = f.read_text(encoding="utf-8", errors="replace")
-        blocks.append(f"##### FILE_START: {rel} #####\n{content}\n##### FILE_END #####")
-    files_text = "\n\n".join(blocks)
-
-    base_prompt = f"""你是程式碼修改助手。請根據下方【指示開始】到【指示結束】之間的內容修改檔案,並【務必】用完全相同的 FILE_START/FILE_END 格式回覆每個檔案(不論有無修改),不要加任何額外說明。
-【指示開始】
-{spec['requirement']}
-【指示結束】
-以下是檔案內容,只有 FILE_START/FILE_END 標記之間的內容才是檔案內容,不要把上面的指示誤認為是檔案內容:
-{files_text}
-
-輸出格式範例(請完全照抄這個格式,只替換檔名與內容,不要使用任何 Markdown 語法,不要用三個反引號包裹輸出):
-##### FILE_START: example.py #####
-def example():
-    pass
-##### FILE_END #####
-
-再次強調:
-1. 每個檔案都必須用「##### FILE_START: 檔名 #####」開頭、「##### FILE_END #####」結尾,前後都是五個 # 號,不可省略,也不可包在 Markdown code fence 裡。
-2. 每個回傳的檔案必須是「完整內容」,包含所有原本就存在、這次沒有要求修改的函式,不可以只回傳被要求修改的那個函式,不可以省略或截斷任何其他函式。
-"""
-
-    MAX_RETRIES = 3
-    prompt = base_prompt
-    matches = []
-    result = ""
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        print(f"\n傳送給本地模型修改中(第 {attempt}/{MAX_RETRIES} 次嘗試,prompt 共 {len(prompt)} 字元),請稍候...")
-        Path("debug_last_prompt.txt").write_text(prompt, encoding="utf-8")
-        resp = ollama.chat(
-            model=LLM_MODEL,
-            messages=[{'role': 'user', 'content': prompt}],
-            options={"num_ctx": 16384, "temperature": 0},
-        )
-        result = resp['message']['content']
-
-        # 確定性清理:先修補常見格式偏差,再交給正則解析
-        cleaned = _clean_model_output(result)
-        matches = PATTERN.findall(cleaned)
-
-        if matches:
-            # 格式解析成功,再做一層確定性驗證(檔名合理性)
-            validity_problems = _validate_matches(matches, known_files)
-            if not validity_problems:
-                # 額外做一次「函式是否無故消失」的預檢查,提前發現就提前重試,
-                # 不用等到 _apply_matches 裡的 _qa_gate 才發現、才要求使用者手動處理
-                missing_problems = []
-                for rel_path, content in matches:
-                    rel_path_stripped = rel_path.strip()
-                    if rel_path_stripped.endswith(".py") and Path(rel_path_stripped).name != SELF_FILE:
-                        missing_problems.extend(_check_missing_functions(rel_path_stripped, content))
-                if not missing_problems:
-                    break
-                else:
-                    print("⚠️ 解析成功但偵測到函式疑似被誤刪:")
-                    for p in missing_problems:
-                        print(f"  - {p}")
-                    matches = []  # 視為本次嘗試失敗,進入重試
-            else:
-                print("⚠️ 解析成功但檔名驗證失敗:")
-                for p in validity_problems:
-                    print(f"  - {p}")
-                matches = []  # 視為本次嘗試失敗,進入重試
-
-        if attempt < MAX_RETRIES:
-            print(f"⚠️ 第 {attempt} 次嘗試不符合要求,將附上錯誤內容要求模型重新輸出...")
-            prompt = base_prompt + f"""
-
-【上一次你的輸出如下,不符合要求(格式錯誤或遺漏了部分函式),請重新輸出完整內容,務必嚴格遵守上面的格式範例,並確保每個檔案都是完整內容】
-{result[:1000]}
-"""
-        else:
-            print(f"\n已重試 {MAX_RETRIES} 次仍無法取得正確結果,放棄本次修改。模型最後一次回覆前 500 字:")
-            print(result[:500])
-            return
-
-    _apply_matches(matches, acceptance=spec["acceptance"])
+    run_edit_pipeline(
+        raw_instruction=instruction,
+        coder_model=LLM_MODEL,
+        files_dir=FILES_DIR,
+        py_files=py_files,
+        spec_model=SPEC_MODEL,
+        self_file=SELF_FILE,
+        max_retries=3,
+        num_ctx=16384,
+        flush_stdin_fn=_flush_stdin,
+    )
 
 
 def extract_relevant_code_with_local_model():
